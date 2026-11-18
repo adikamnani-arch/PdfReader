@@ -1,269 +1,460 @@
 package com.personal.pdfreader
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
-import android.graphics.Bitmap
+import android.content.pm.PackageManager
 import android.graphics.Color
-import android.graphics.ColorMatrixColorFilter
-import android.graphics.pdf.PdfRenderer
+import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.ParcelFileDescriptor
-import android.text.InputType
-import android.view.MotionEvent
-import android.view.ScaleGestureDetector
+import android.os.Environment
+import android.provider.Settings
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.Gravity
+import android.view.TextUtils
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
-import android.widget.HorizontalScrollView
-import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
 class MainActivity : Activity() {
 
-    private var renderer: PdfRenderer? = null
-    private var pfd: ParcelFileDescriptor? = null
     private lateinit var list: RecyclerView
-    private lateinit var lm: LinearLayoutManager
-    private lateinit var info: TextView
-    private var scale = 1f
-    private var pending = 1f
-    private var dark = false
-    private var currentKey = ""
-    private lateinit var scaleDetector: ScaleGestureDetector
-    private val prefs by lazy { getSharedPreferences("reader", MODE_PRIVATE) }
-    private val reqOpen = 1
+    private lateinit var msg: TextView
+    private lateinit var permBtn: Button
+    private lateinit var search: EditText
+    private lateinit var sortBtn: Button
+    private val tabBtns = ArrayList<Button>()
+    private var all: List<Item> = emptyList()
+    private var shown: List<Item> = emptyList()
+    private var favSet: Set<String> = emptySet()
+    private var tab = 0
+    private var sortMode = 0
+    private var scanning = false
+    private val sortNames = arrayOf("Date", "Name", "Size")
+    private val adapter = FileAdapter()
+    private val reqPick = 2
 
-    private val invert = ColorMatrixColorFilter(
-        floatArrayOf(
-            -1f, 0f, 0f, 0f, 255f,
-            0f, -1f, 0f, 0f, 255f,
-            0f, 0f, -1f, 0f, 255f,
-            0f, 0f, 0f, 1f, 0f
-        )
-    )
+    private fun dp(x: Int): Int = (x * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        dark = prefs.getBoolean("dark", false)
         buildUi()
-        scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            override fun onScaleBegin(d: ScaleGestureDetector): Boolean { pending = 1f; return true }
-            override fun onScale(d: ScaleGestureDetector): Boolean { pending *= d.scaleFactor; return true }
-            override fun onScaleEnd(d: ScaleGestureDetector) { setScale(scale * pending) }
-        })
-        if (!handleIntent(intent)) {
-            prefs.getString("lastUri", null)?.let { open(Uri.parse(it), true) }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (hasAccess()) {
+            permBtn.visibility = View.GONE
+            if (all.isEmpty() && !scanning) scan() else refresh()
+        } else {
+            permBtn.visibility = View.VISIBLE
+            msg.visibility = View.VISIBLE
+            msg.text = "Phone ki PDF files dikhane ke liye \"All files access\" ki permission chahiye. Ye app internet use nahi karti."
+            all = emptyList()
+            refresh()
         }
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        handleIntent(intent)
-    }
-
-    private fun handleIntent(i: Intent?): Boolean {
-        val data = i?.data
-        if (i?.action == Intent.ACTION_VIEW && data != null) {
-            return open(data, false)
-        }
-        return false
+    private fun smallBtn(t: String, click: () -> Unit): Button {
+        val b = Button(this)
+        b.text = t
+        b.isAllCaps = false
+        b.textSize = 12f
+        b.minWidth = 0
+        b.minimumWidth = 0
+        b.setOnClickListener { click() }
+        return b
     }
 
     private fun buildUi() {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
 
-        val hsv = HorizontalScrollView(this)
-        lm = LinearLayoutManager(this)
-        list = RecyclerView(this)
-        list.layoutManager = lm
-        list.layoutParams = ViewGroup.LayoutParams(resources.displayMetrics.widthPixels, ViewGroup.LayoutParams.MATCH_PARENT)
-        list.addOnScrollListener(object : RecyclerView.OnScrollListener() {
-            override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) { updateInfo() }
-        })
-        hsv.addView(list)
-        root.addView(hsv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.setPadding(dp(16), dp(8), dp(8), 0)
+        val title = TextView(this)
+        title.text = "PDF Reader"
+        title.textSize = 22f
+        title.setTypeface(null, Typeface.BOLD)
+        top.addView(title, LinearLayout.LayoutParams(0, WRAP, 1f))
+        top.addView(smallBtn("Open") { pick() })
+        sortBtn = smallBtn("Sort: Date") { cycleSort() }
+        top.addView(sortBtn)
+        top.addView(smallBtn("Refresh") { if (hasAccess()) scan() })
+        root.addView(top)
 
-        info = TextView(this)
-        info.setPadding(16, 8, 16, 8)
-        info.text = "PDF kholne ke liye Open dabao"
-        root.addView(info)
+        search = EditText(this)
+        search.hint = "Search PDF..."
+        search.isSingleLine = true
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) { refresh() }
+            override fun afterTextChanged(s: Editable?) {}
+        })
+        val slp = LinearLayout.LayoutParams(MATCH, WRAP)
+        slp.setMargins(dp(12), 0, dp(12), 0)
+        root.addView(search, slp)
+
+        permBtn = smallBtn("Permission do") { askAccess() }
+        permBtn.visibility = View.GONE
+        root.addView(permBtn)
+
+        msg = TextView(this)
+        msg.gravity = Gravity.CENTER
+        msg.setPadding(dp(20), dp(20), dp(20), dp(20))
+        msg.visibility = View.GONE
+        root.addView(msg)
+
+        list = RecyclerView(this)
+        list.layoutManager = LinearLayoutManager(this)
+        list.adapter = adapter
+        root.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.HORIZONTAL
-        bar.addView(btn("Open") { pick() })
-        bar.addView(btn("-") { setScale(scale - 0.5f) })
-        bar.addView(btn("+") { setScale(scale + 0.5f) })
-        bar.addView(btn("Dark") { toggleDark() })
-        bar.addView(btn("Go") { goToPage() })
+        val names = arrayOf("Home", "Recent", "Favorites", "Bin")
+        for (i in names.indices) {
+            val b = Button(this)
+            b.text = names[i]
+            b.isAllCaps = false
+            b.textSize = 13f
+            b.setOnClickListener { tab = i; refresh() }
+            b.layoutParams = LinearLayout.LayoutParams(0, WRAP, 1f)
+            tabBtns.add(b)
+            bar.addView(b)
+        }
         root.addView(bar)
 
         setContentView(root)
-        applyBackground()
     }
 
-    private fun btn(t: String, click: () -> Unit): Button {
-        val b = Button(this)
-        b.text = t
-        b.isAllCaps = false
-        b.setOnClickListener { click() }
-        b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        return b
+    private fun hasAccess(): Boolean {
+        return if (Build.VERSION.SDK_INT >= 30) {
+            Environment.isExternalStorageManager()
+        } else {
+            checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
-    private fun applyBackground() {
-        list.setBackgroundColor(if (dark) Color.BLACK else Color.LTGRAY)
+    private fun askAccess() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + packageName)))
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
+        } else {
+            requestPermissions(
+                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE), 10
+            )
+        }
     }
 
-    private fun toggleDark() {
-        dark = !dark
-        prefs.edit().putBoolean("dark", dark).apply()
-        applyBackground()
-        list.adapter?.notifyDataSetChanged()
+    private fun scan() {
+        if (scanning) return
+        scanning = true
+        refresh()
+        Thread {
+            val out = ArrayList<Item>()
+            try { walk(Environment.getExternalStorageDirectory(), 0, out) } catch (e: Exception) { }
+            runOnUiThread {
+                all = out
+                scanning = false
+                refresh()
+            }
+        }.start()
     }
 
-    private fun setScale(s: Float) {
-        scale = s.coerceIn(1f, 2.5f)
-        val pos = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
-        val lp = list.layoutParams
-        lp.width = (resources.displayMetrics.widthPixels * scale).toInt()
-        list.layoutParams = lp
-        list.adapter?.notifyDataSetChanged()
-        lm.scrollToPositionWithOffset(pos, 0)
+    private fun walk(dir: File, depth: Int, out: MutableList<Item>) {
+        val files = dir.listFiles() ?: return
+        for (f in files) {
+            val n = f.name
+            if (n.startsWith(".")) continue
+            if (f.isDirectory) {
+                if (depth == 0 && n == "Android") continue
+                if (depth < 10) walk(f, depth + 1, out)
+            } else if (n.endsWith(".pdf", true)) {
+                out.add(Item(f.absolutePath, n, f.length(), f.lastModified()))
+            }
+        }
+    }
+
+    private fun cycleSort() {
+        sortMode = (sortMode + 1) % 3
+        sortBtn.text = "Sort: " + sortNames[sortMode]
+        refresh()
+    }
+
+    private fun toItems(paths: Collection<String>): List<Item> {
+        val out = ArrayList<Item>()
+        for (p in paths) {
+            val f = File(p)
+            if (f.exists()) out.add(Item(f.absolutePath, f.name, f.length(), f.lastModified()))
+        }
+        return out
+    }
+
+    private fun refresh() {
+        favSet = Store.favs(this)
+        val base: List<Item> = when (tab) {
+            0 -> all
+            1 -> toItems(Store.recents(this))
+            2 -> toItems(favSet)
+            else -> Store.trashItems(this)
+        }
+        val q = search.text.toString().trim()
+        var l: List<Item> = if (q.isEmpty()) base else base.filter { it.name.contains(q, true) }
+        if (tab != 1) {
+            l = when (sortMode) {
+                0 -> l.sortedByDescending { it.mod }
+                1 -> l.sortedBy { it.name.lowercase() }
+                else -> l.sortedByDescending { it.size }
+            }
+        }
+        shown = l
+        adapter.notifyDataSetChanged()
+        for (i in tabBtns.indices) {
+            tabBtns[i].alpha = if (i == tab) 1f else 0.5f
+            tabBtns[i].setTypeface(null, if (i == tab) Typeface.BOLD else Typeface.NORMAL)
+        }
+        if (!hasAccess()) return
+        if (scanning && tab == 0) {
+            msg.visibility = View.VISIBLE
+            msg.text = "PDF files dhundh raha hu..."
+        } else if (shown.isEmpty()) {
+            msg.visibility = View.VISIBLE
+            msg.text = when (tab) {
+                1 -> "Abhi koi recent file nahi hai"
+                2 -> "Koi favorite nahi hai. File ke 3-dot menu se favorite karo"
+                3 -> "Bin khaali hai"
+                else -> "Koi PDF nahi mili"
+            }
+        } else {
+            msg.visibility = View.GONE
+        }
     }
 
     private fun pick() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
         i.addCategory(Intent.CATEGORY_OPENABLE)
         i.type = "application/pdf"
-        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-        startActivityForResult(i, reqOpen)
+        startActivityForResult(i, reqPick)
     }
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         val uri = data?.data
-        if (requestCode == reqOpen && resultCode == RESULT_OK && uri != null) {
-            try {
-                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (e: Exception) { }
-            open(uri, false)
+        if (requestCode == reqPick && resultCode == RESULT_OK && uri != null) {
+            val i = Intent(this, ViewerActivity::class.java)
+            i.action = Intent.ACTION_VIEW
+            i.data = uri
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(i)
         }
     }
 
-    private fun goToPage() {
-        val r = renderer ?: return
+    private fun openItem(item: Item) {
+        val i = Intent(this, ViewerActivity::class.java)
+        i.putExtra("path", item.path)
+        startActivity(i)
+    }
+
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+    private fun fmt(b: Long): String = when {
+        b >= 1048576 -> String.format(Locale.US, "%.2f MB", b / 1048576.0)
+        b >= 1024 -> String.format(Locale.US, "%.1f KB", b / 1024.0)
+        else -> b.toString() + " B"
+    }
+
+    private fun showMenu(anchor: View, item: Item) {
+        val pm = PopupMenu(this, anchor)
+        if (tab == 3) {
+            pm.menu.add(0, 6, 0, "Restore")
+            pm.menu.add(0, 7, 1, "Delete forever")
+        } else {
+            pm.menu.add(0, 1, 0, if (favSet.contains(item.path)) "Remove favorite" else "Add to favorites")
+            pm.menu.add(0, 2, 1, "Share")
+            pm.menu.add(0, 3, 2, "Rename")
+            pm.menu.add(0, 4, 3, "Details")
+            pm.menu.add(0, 5, 4, "Delete")
+        }
+        pm.setOnMenuItemClickListener { m ->
+            when (m.itemId) {
+                1 -> { Store.toggleFav(this, item.path); refresh() }
+                2 -> share(item)
+                3 -> rename(item)
+                4 -> details(item)
+                5 -> confirmDelete(item)
+                6 -> {
+                    val r = Store.restore(this, File(item.path))
+                    if (r != null) {
+                        toast("Restore ho gayi: " + r.name)
+                        scan()
+                    } else toast("Restore nahi ho payi")
+                    refresh()
+                }
+                7 -> AlertDialog.Builder(this)
+                    .setTitle("Hamesha ke liye delete?")
+                    .setMessage(item.name)
+                    .setPositiveButton("Delete") { _, _ ->
+                        Store.deleteForever(this, File(item.path))
+                        refresh()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            true
+        }
+        pm.show()
+    }
+
+    private fun share(item: Item) {
+        try {
+            val uri = FileProvider.getUriForFile(this, packageName + ".fileprovider", File(item.path))
+            val i = Intent(Intent.ACTION_SEND)
+            i.type = "application/pdf"
+            i.putExtra(Intent.EXTRA_STREAM, uri)
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(i, "Share PDF"))
+        } catch (e: Exception) {
+            toast("Share nahi ho paya")
+        }
+    }
+
+    private fun rename(item: Item) {
         val et = EditText(this)
-        et.inputType = InputType.TYPE_CLASS_NUMBER
-        et.hint = "1 - " + r.pageCount
+        et.setText(File(item.path).nameWithoutExtension)
         AlertDialog.Builder(this)
-            .setTitle("Page number")
+            .setTitle("Rename")
             .setView(et)
-            .setPositiveButton("Go") { _, _ ->
-                val n = et.text.toString().toIntOrNull()
-                if (n != null && n in 1..r.pageCount) {
-                    lm.scrollToPositionWithOffset(n - 1, 0)
+            .setPositiveButton("OK") { _, _ ->
+                var n = et.text.toString().trim().replace("/", "")
+                if (n.isNotEmpty()) {
+                    if (!n.endsWith(".pdf", true)) n += ".pdf"
+                    val f = File(item.path)
+                    val dst = File(f.parentFile, n)
+                    if (dst.exists()) {
+                        toast("Is naam ki file pehle se hai")
+                    } else if (f.renameTo(dst)) {
+                        Store.renamePath(this, f.absolutePath, dst.absolutePath)
+                        all = all.map { x ->
+                            if (x.path == item.path) Item(dst.absolutePath, dst.name, x.size, x.mod) else x
+                        }
+                        refresh()
+                    } else {
+                        toast("Rename nahi ho paya")
+                    }
                 }
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun closeDoc() {
-        try { renderer?.close() } catch (e: Exception) { }
-        try { pfd?.close() } catch (e: Exception) { }
-        renderer = null
-        pfd = null
+    private fun details(item: Item) {
+        val d = SimpleDateFormat("dd-MMM-yyyy HH:mm", Locale.getDefault()).format(Date(item.mod))
+        AlertDialog.Builder(this)
+            .setTitle("Details")
+            .setMessage("Naam: " + item.name + "\n\nSize: " + fmt(item.size) + "\n\nModified: " + d + "\n\nJagah: " + item.path)
+            .setPositiveButton("OK", null)
+            .show()
     }
 
-    private fun open(uri: Uri, quiet: Boolean): Boolean {
-        try {
-            val d = contentResolver.openFileDescriptor(uri, "r") ?: return false
-            val r = PdfRenderer(d)
-            saveProgress()
-            list.adapter = null
-            closeDoc()
-            pfd = d
-            renderer = r
-            currentKey = uri.toString()
-            prefs.edit().putString("lastUri", currentKey).apply()
-            list.adapter = PageAdapter()
-            val last = prefs.getInt("page_" + currentKey.hashCode(), 0)
-            lm.scrollToPositionWithOffset(last, 0)
-            updateInfo()
-            return true
-        } catch (e: Exception) {
-            if (!quiet) Toast.makeText(this, "PDF nahi khul saki (password ya kharab file?)", Toast.LENGTH_LONG).show()
-            return false
-        }
+    private fun confirmDelete(item: Item) {
+        AlertDialog.Builder(this)
+            .setTitle("Bin mein bhejna hai?")
+            .setMessage(item.name + "\n\nBin se wapas la sakte ho.")
+            .setPositiveButton("Delete") { _, _ ->
+                try {
+                    Store.toTrash(this, File(item.path))
+                    all = all.filter { x -> x.path != item.path }
+                    toast("Bin mein bhej di")
+                } catch (e: Exception) {
+                    toast("Delete nahi ho paya")
+                }
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
-    private fun updateInfo() {
-        val r = renderer ?: return
-        val p = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
-        info.text = "Page " + (p + 1) + " / " + r.pageCount
-    }
+    inner class FileAdapter : RecyclerView.Adapter<FileAdapter.VH>() {
+        inner class VH(v: View, val name: TextView, val meta: TextView, val more: TextView) :
+            RecyclerView.ViewHolder(v)
 
-    private fun saveProgress() {
-        if (renderer == null || currentKey.isEmpty()) return
-        val p = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
-        prefs.edit().putInt("page_" + currentKey.hashCode(), p).apply()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        saveProgress()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        closeDoc()
-    }
-
-    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        scaleDetector.onTouchEvent(ev)
-        return super.dispatchTouchEvent(ev)
-    }
-
-    inner class PageAdapter : RecyclerView.Adapter<PageAdapter.VH>() {
-        inner class VH(val iv: ImageView) : RecyclerView.ViewHolder(iv)
-
-        override fun getItemCount(): Int = renderer?.pageCount ?: 0
+        override fun getItemCount(): Int = shown.size
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
-            val iv = ImageView(parent.context)
-            iv.layoutParams = RecyclerView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            iv.adjustViewBounds = true
-            return VH(iv)
+            val row = LinearLayout(parent.context)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.setPadding(dp(12), dp(10), dp(4), dp(10))
+            row.layoutParams = RecyclerView.LayoutParams(MATCH, WRAP)
+
+            val badge = TextView(parent.context)
+            badge.text = "PDF"
+            badge.setTextColor(Color.WHITE)
+            badge.setBackgroundColor(Color.parseColor("#D32F2F"))
+            badge.gravity = Gravity.CENTER
+            badge.textSize = 11f
+            badge.setTypeface(null, Typeface.BOLD)
+            row.addView(badge, LinearLayout.LayoutParams(dp(44), dp(52)))
+
+            val col = LinearLayout(parent.context)
+            col.orientation = LinearLayout.VERTICAL
+            val clp = LinearLayout.LayoutParams(0, WRAP, 1f)
+            clp.setMargins(dp(12), 0, dp(4), 0)
+            val name = TextView(parent.context)
+            name.textSize = 16f
+            name.maxLines = 2
+            name.ellipsize = TextUtils.TruncateAt.END
+            val meta = TextView(parent.context)
+            meta.textSize = 12f
+            meta.setTextColor(Color.GRAY)
+            col.addView(name)
+            col.addView(meta)
+            row.addView(col, clp)
+
+            val more = TextView(parent.context)
+            more.text = "\u22EE"
+            more.textSize = 24f
+            more.setPadding(dp(14), dp(8), dp(14), dp(8))
+            row.addView(more)
+            return VH(row, name, meta, more)
         }
 
-        override fun onBindViewHolder(holder: VH, position: Int) {
-            val r = renderer ?: return
-            val w = (resources.displayMetrics.widthPixels * scale).toInt()
-            synchronized(r) {
-                val page = r.openPage(position)
-                val h = (w.toFloat() * page.height / page.width).toInt().coerceAtLeast(1)
-                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                bmp.eraseColor(Color.WHITE)
-                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                page.close()
-                holder.iv.setImageBitmap(bmp)
+        override fun onBindViewHolder(h: VH, position: Int) {
+            val item = shown[position]
+            h.name.text = item.name
+            val star = if (tab != 3 && favSet.contains(item.path)) "\u2605 " else ""
+            val d = SimpleDateFormat("dd-MMM-yyyy", Locale.getDefault()).format(Date(item.mod))
+            h.meta.text = star + fmt(item.size) + "  \u2022  " + d
+            h.itemView.setOnClickListener {
+                if (tab == 3) toast("Restore ya delete ke liye 3-dot dabao") else openItem(item)
             }
-            holder.iv.colorFilter = if (dark) invert else null
-        }
-
-        override fun onViewRecycled(holder: VH) {
-            holder.iv.setImageDrawable(null)
+            h.more.setOnClickListener { showMenu(h.more, item) }
         }
     }
 }
