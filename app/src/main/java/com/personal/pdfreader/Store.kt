@@ -106,4 +106,40 @@ object Store {
         trashFile.delete()
         trashPrefs(c).edit().remove(trashFile.name).apply()
     }
+
+    private fun readerPrefs(c: Context) = c.getSharedPreferences("reader", Context.MODE_PRIVATE)
+
+    fun bookmarks(c: Context, key: String): MutableList<Int> {
+        val s = readerPrefs(c).getString("bm_" + key.hashCode(), "") ?: ""
+        if (s.isEmpty()) return ArrayList()
+        val out = ArrayList<Int>()
+        for (part in s.split(",")) {
+            val n = part.toIntOrNull()
+            if (n != null) out.add(n)
+        }
+        return out
+    }
+
+    private fun saveBookmarks(c: Context, key: String, l: List<Int>) {
+        readerPrefs(c).edit().putString("bm_" + key.hashCode(), l.joinToString(",")).apply()
+    }
+
+    fun toggleBookmark(c: Context, key: String, page: Int): Boolean {
+        val l = bookmarks(c, key)
+        val on: Boolean
+        if (l.contains(page)) {
+            l.remove(page)
+            on = false
+        } else {
+            l.add(page)
+            l.sort()
+            on = true
+        }
+        saveBookmarks(c, key, l)
+        return on
+    }
+
+    fun clearBookmarks(c: Context, key: String) {
+        saveBookmarks(c, key, emptyList())
+    }
 }
