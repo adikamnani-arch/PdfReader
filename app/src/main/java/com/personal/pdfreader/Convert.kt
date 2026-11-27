@@ -4,10 +4,13 @@ import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
@@ -29,8 +32,77 @@ import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.min
 
 object Convert {
+
+    val filterNames = arrayOf("Original", "Clear", "Magic colour", "Grayscale", "Black & White")
+
+    private fun matrixFor(f: Int): ColorMatrix {
+        return when (f) {
+            1 -> {
+                val g = 1.25f
+                val t = (0.5f - 0.5f * g) * 255f + 8f
+                ColorMatrix(floatArrayOf(
+                    g, 0f, 0f, 0f, t,
+                    0f, g, 0f, 0f, t,
+                    0f, 0f, g, 0f, t,
+                    0f, 0f, 0f, 1f, 0f
+                ))
+            }
+            2 -> {
+                val g = 1.6f
+                val t = -55f
+                ColorMatrix(floatArrayOf(
+                    g, 0f, 0f, 0f, t,
+                    0f, g, 0f, 0f, t,
+                    0f, 0f, g, 0f, t,
+                    0f, 0f, 0f, 1f, 0f
+                ))
+            }
+            3 -> {
+                val m = ColorMatrix()
+                m.setSaturation(0f)
+                m
+            }
+            else -> {
+                val k = 8f
+                val t = 128f - k * 128f
+                ColorMatrix(floatArrayOf(
+                    k * 0.299f, k * 0.587f, k * 0.114f, 0f, t,
+                    k * 0.299f, k * 0.587f, k * 0.114f, 0f, t,
+                    k * 0.299f, k * 0.587f, k * 0.114f, 0f, t,
+                    0f, 0f, 0f, 1f, 0f
+                ))
+            }
+        }
+    }
+
+    // returns a new bitmap for filters 1..4, the same bitmap for 0 (Original)
+    fun applyFilter(src: Bitmap, f: Int): Bitmap {
+        if (f == 0) return src
+        val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        val p = Paint(Paint.FILTER_BITMAP_FLAG)
+        p.colorFilter = ColorMatrixColorFilter(matrixFor(f))
+        Canvas(out).drawBitmap(src, 0f, 0f, p)
+        return out
+    }
+
+    fun loadPreview(ctx: Context, uri: Uri, maxSide: Int): Bitmap? = loadBitmap(ctx, uri, maxSide)
+
+    fun pagePreview(ctx: Context, path: String?, uri: Uri?, w: Int): Bitmap {
+        val pfd = openPfd(ctx, path, uri)
+        val r = PdfRenderer(pfd)
+        val page = r.openPage(0)
+        val h = (w.toFloat() * page.height / page.width).toInt().coerceAtLeast(1)
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        bmp.eraseColor(Color.WHITE)
+        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+        page.close()
+        r.close()
+        pfd.close()
+        return bmp
+    }
 
     fun outDir(): File {
         val d = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "PDF Reader")
@@ -83,17 +155,51 @@ object Convert {
         }
     }
 
-    fun imagesToPdf(ctx: Context, uris: List<Uri>): File {
+    // pageMode: 0 = A4 portrait, 1 = A4 landscape, 2 = page as big as the photo
+    fun imagesToPdf(ctx: Context, uris: List<Uri>, filter: Int, pageMode: Int, rotateFill: Boolean): File {
         val doc = PdfDocument()
         var n = 0
         for (u in uris) {
-            val bmp = loadBitmap(ctx, u, 2000) ?: continue
+            var bmp: Bitmap = loadBitmap(ctx, u, 2000) ?: continue
             n++
-            val pw = 595
-            val ph = (pw.toFloat() * bmp.height / bmp.width).toInt().coerceAtLeast(1)
+            if (filter != 0) {
+                val fb = applyFilter(bmp, filter)
+                bmp.recycle()
+                bmp = fb
+            }
+            val pw: Int
+            val ph: Int
+            if (pageMode == 2) {
+                pw = 595
+                ph = (595f * bmp.height / bmp.width).toInt().coerceAtLeast(1)
+            } else if (pageMode == 1) {
+                pw = 842
+                ph = 595
+            } else {
+                pw = 595
+                ph = 842
+            }
+            if (pageMode != 2 && rotateFill) {
+                val imgLandscape = bmp.width > bmp.height
+                val pageLandscape = pw > ph
+                if (imgLandscape != pageLandscape) {
+                    val m = Matrix()
+                    m.postRotate(90f)
+                    val r = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                    bmp.recycle()
+                    bmp = r
+                }
+            }
             val page = doc.startPage(PdfDocument.PageInfo.Builder(pw, ph, n).create())
-            page.canvas.drawColor(Color.WHITE)
-            page.canvas.drawBitmap(bmp, null, Rect(0, 0, pw, ph), Paint(Paint.FILTER_BITMAP_FLAG))
+            val c = page.canvas
+            c.drawColor(Color.WHITE)
+            val margin = if (pageMode == 2) 0f else 20f
+            val s = min((pw - 2 * margin) / bmp.width, (ph - 2 * margin) / bmp.height)
+            val dw = bmp.width * s
+            val dh = bmp.height * s
+            val left = (pw - dw) / 2f
+            val top = (ph - dh) / 2f
+            c.drawBitmap(bmp, null, RectF(left, top, left + dw, top + dh), Paint(Paint.FILTER_BITMAP_FLAG))
             doc.finishPage(page)
             bmp.recycle()
         }
@@ -116,7 +222,7 @@ object Convert {
     }
 
     // returns the folder that holds the images
-    fun pdfToImages(ctx: Context, path: String?, uri: Uri?, baseName: String): File {
+    fun pdfToImages(ctx: Context, path: String?, uri: Uri?, baseName: String, filter: Int, format: Int): File {
         val pfd = openPfd(ctx, path, uri)
         val r = PdfRenderer(pfd)
         val out = File(picDir(), baseName + "_" + stamp())
@@ -126,12 +232,19 @@ object Convert {
             val page = r.openPage(i)
             val w = 1600
             val h = (w.toFloat() * page.height / page.width).toInt().coerceAtLeast(1)
-            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            var bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             bmp.eraseColor(Color.WHITE)
             page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
             page.close()
-            val f = File(out, "page_" + (i + 1) + ".jpg")
-            FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+            if (filter != 0) {
+                val fb = applyFilter(bmp, filter)
+                bmp.recycle()
+                bmp = fb
+            }
+            val ext = if (format == 1) "png" else "jpg"
+            val cf = if (format == 1) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val f = File(out, "page_" + (i + 1) + "." + ext)
+            FileOutputStream(f).use { bmp.compress(cf, 92, it) }
             bmp.recycle()
             files.add(f.absolutePath)
         }

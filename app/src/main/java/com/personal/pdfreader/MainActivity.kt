@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -23,11 +24,15 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -61,6 +66,7 @@ class MainActivity : Activity() {
     private var tab = 0 // 0 Home, 1 Recent, 2 Favorites, 3 Tools, 4 Bin
     private var sortMode = 0
     private var scanning = false
+    private var lastScan = 0L
     private val sortNames = arrayOf("Date", "Name", "Size")
     private val adapter = FileAdapter()
     private val prefs: SharedPreferences by lazy { getSharedPreferences("reader", MODE_PRIVATE) }
@@ -82,7 +88,8 @@ class MainActivity : Activity() {
         super.onResume()
         if (hasAccess()) {
             permBtn.visibility = View.GONE
-            if (all.isEmpty() && !scanning) scan() else refresh()
+            refresh()
+            if (!scanning && (all.isEmpty() || System.currentTimeMillis() - lastScan > 20000)) scan()
         } else {
             permBtn.visibility = View.VISIBLE
             msg.visibility = View.VISIBLE
@@ -370,6 +377,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 all = out
                 scanning = false
+                lastScan = System.currentTimeMillis()
                 refresh()
             }
         }.start()
@@ -381,7 +389,11 @@ class MainActivity : Activity() {
             val n = f.name
             if (n.startsWith(".")) continue
             if (f.isDirectory) {
-                if (depth == 0 && n == "Android") continue
+                if (depth == 0 && n == "Android") {
+                    val media = File(f, "media")
+                    if (media.isDirectory) walk(media, 1, out)
+                    continue
+                }
                 if (depth < 10) walk(f, depth + 1, out)
             } else if (n.endsWith(".pdf", true)) {
                 out.add(Item(f.absolutePath, n, f.length(), f.lastModified()))
@@ -438,7 +450,7 @@ class MainActivity : Activity() {
         shown = l
         adapter.notifyDataSetChanged()
         if (tab != 4 && !hasAccess()) return
-        if (scanning && tab == 0) {
+        if (shown.isEmpty() && scanning && tab == 0) {
             msg.visibility = View.VISIBLE
             msg.text = "PDF files dhundh raha hu..."
         } else if (shown.isEmpty()) {
@@ -486,10 +498,15 @@ class MainActivity : Activity() {
                 } else if (uri != null) {
                     picked.add(uri)
                 }
-                if (picked.isNotEmpty()) imagesToPdf(picked)
+                if (picked.isNotEmpty()) {
+                    val prev = Convert.loadPreview(this, picked[0], 450)
+                    convertDialog("PDF kaisi banani hai?", prev, true, false) { f, pm, rot, _ ->
+                        imagesToPdf(picked, f, pm, rot)
+                    }
+                }
             }
             reqImport -> if (uri != null) importPdf(uri)
-            reqPdf2Img -> if (uri != null) pdfToImages(null, uri, displayName(uri).removeSuffix(".pdf"))
+            reqPdf2Img -> if (uri != null) askPdfToImage(null, uri, displayName(uri).removeSuffix(".pdf"))
             reqPrint -> if (uri != null) Convert.print(this, null, uri, displayName(uri))
             reqShare -> if (uri != null) shareUri(uri)
         }
@@ -510,8 +527,97 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun imagesToPdf(uris: List<Uri>) {
-        runBg("PDF ban rahi hai...", { Convert.imagesToPdf(this, uris) }) { f ->
+    // one dialog for "Image to PDF" and "PDF to Image": preview + filter (+ page size / format)
+    private fun convertDialog(
+        title: String,
+        preview: Bitmap?,
+        withPage: Boolean,
+        withFormat: Boolean,
+        onOk: (Int, Int, Boolean, Int) -> Unit
+    ) {
+        var filter = 0
+        var pageMode = 0
+        var rotate = false
+        var format = 0
+
+        val sv = android.widget.ScrollView(this)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(20), dp(8), dp(20), dp(8))
+        sv.addView(col)
+
+        var pv: ImageView? = null
+        if (preview != null) {
+            val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.FIT_CENTER
+            iv.setBackgroundColor(Color.parseColor("#E4E4EA"))
+            col.addView(iv, LinearLayout.LayoutParams(MATCH, dp(220)))
+            pv = iv
+        }
+        fun showPreview() {
+            val p = preview
+            val iv = pv
+            if (p != null && iv != null) iv.setImageBitmap(Convert.applyFilter(p, filter))
+        }
+        fun label(t: String) {
+            val v = TextView(this)
+            v.text = t
+            v.textSize = 12f
+            v.setTextColor(Color.GRAY)
+            v.setPadding(0, dp(14), 0, dp(4))
+            col.addView(v)
+        }
+        fun group(opts: Array<String>, horizontal: Boolean, cb: (Int) -> Unit): RadioGroup {
+            val g = RadioGroup(this)
+            g.orientation = if (horizontal) RadioGroup.HORIZONTAL else RadioGroup.VERTICAL
+            for (o in opts) {
+                val rb = RadioButton(this)
+                rb.text = o
+                rb.textSize = 13f
+                rb.id = View.generateViewId()
+                g.addView(rb)
+            }
+            (g.getChildAt(0) as RadioButton).isChecked = true
+            g.setOnCheckedChangeListener { grp, id -> cb(grp.indexOfChild(grp.findViewById(id))) }
+            return g
+        }
+
+        label("FILTER")
+        val hs = HorizontalScrollView(this)
+        hs.addView(group(Convert.filterNames, true) { i ->
+            filter = i
+            showPreview()
+        })
+        col.addView(hs)
+
+        if (withPage) {
+            label("PAGE")
+            col.addView(group(arrayOf("A4 Portrait (seedha page)", "A4 Landscape (aada page)", "Photo jitna bada page"), false) { i ->
+                pageMode = i
+            })
+            val cb = CheckBox(this)
+            cb.text = "Photo ko page ke hisaab se ghuma do (page bhar jaye)"
+            cb.setOnCheckedChangeListener { _, b -> rotate = b }
+            col.addView(cb)
+        }
+        if (withFormat) {
+            label("FORMAT")
+            col.addView(group(arrayOf("JPG (chhoti file)", "PNG (best quality)"), true) { i ->
+                format = i
+            })
+        }
+        showPreview()
+
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(sv)
+            .setPositiveButton("Banao") { _, _ -> onOk(filter, pageMode, rotate, format) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun imagesToPdf(uris: List<Uri>, filter: Int, pageMode: Int, rotate: Boolean) {
+        runBg("PDF ban rahi hai...", { Convert.imagesToPdf(this, uris, filter, pageMode, rotate) }) { f ->
             if (f != null) {
                 toast("Ban gayi: Documents/PDF Reader/" + f.name)
                 all = all + Item(f.absolutePath, f.name, f.length(), f.lastModified())
@@ -523,8 +629,19 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun pdfToImages(path: String?, uri: Uri?, baseName: String) {
-        runBg("Images ban rahi hain...", { Convert.pdfToImages(this, path, uri, baseName) }) { folder ->
+    private fun askPdfToImage(path: String?, uri: Uri?, baseName: String) {
+        val prev: Bitmap? = try {
+            Convert.pagePreview(this, path, uri, 450)
+        } catch (e: Exception) {
+            null
+        }
+        convertDialog("Images kaisi banani hain?", prev, false, true) { f, _, _, fmt ->
+            pdfToImages(path, uri, baseName, f, fmt)
+        }
+    }
+
+    private fun pdfToImages(path: String?, uri: Uri?, baseName: String, filter: Int, format: Int) {
+        runBg("Images ban rahi hain...", { Convert.pdfToImages(this, path, uri, baseName, filter, format) }) { folder ->
             if (folder != null) {
                 val n = folder.listFiles()?.size ?: 0
                 AlertDialog.Builder(this)
@@ -635,7 +752,7 @@ class MainActivity : Activity() {
                     .setNegativeButton("Cancel", null)
                     .show()
                 8 -> Convert.print(this, item.path, null, item.name)
-                9 -> if (ensureAccess()) pdfToImages(item.path, null, File(item.path).nameWithoutExtension)
+                9 -> if (ensureAccess()) askPdfToImage(item.path, null, File(item.path).nameWithoutExtension)
             }
             true
         }
